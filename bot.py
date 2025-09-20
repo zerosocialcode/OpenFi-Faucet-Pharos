@@ -4,7 +4,7 @@ import random
 from datetime import datetime
 import pytz
 
-from web3 import Web3
+from web3 import Web3, HTTPProvider
 from web3.exceptions import TransactionNotFound
 from eth_account import Account
 from colorama import Fore, Style, init
@@ -43,8 +43,23 @@ def header():
 def obfuscate(addr):
     return f"{addr[:4]}...{addr[-4:]}"
 
-def fetch_web3():
-    return Web3(Web3.HTTPProvider(NODE_ENDPOINT))
+def parse_proxies():
+    try:
+        with open('proxy.txt', 'r') as f:
+            proxies = [line.strip() for line in f if line.strip()]
+        return proxies
+    except Exception:
+        return []
+
+def fetch_web3(proxy=None):
+    import os
+    if proxy:
+        os.environ['http_proxy'] = proxy
+        os.environ['https_proxy'] = proxy
+    else:
+        os.environ.pop('http_proxy', None)
+        os.environ.pop('https_proxy', None)
+    return Web3(HTTPProvider(NODE_ENDPOINT))
 
 def derive_addr(priv):
     try:
@@ -73,8 +88,8 @@ async def await_receipt(web3, tx_hash, max_retry=5):
         await asyncio.sleep(2 ** i)
     raise Exception("Receipt not found after retries")
 
-async def faucet_mint(priv, addr, asset_addr, label):
-    web3 = fetch_web3()
+async def faucet_mint(priv, addr, asset_addr, label, proxy=None):
+    web3 = fetch_web3(proxy)
     router = web3.eth.contract(address=web3.to_checksum_address(ROUTER_ADDR), abi=OPENFI_ABI)
     asset = web3.eth.contract(address=web3.to_checksum_address(asset_addr), abi=ERC20_ABI)
     decimals = asset.functions.decimals().call()
@@ -108,8 +123,8 @@ async def faucet_mint(priv, addr, asset_addr, label):
     banner(f"{Fore.WHITE}Explorer: {explorer}")
     return tx_hash, block
 
-def get_balances(addr):
-    web3 = fetch_web3()
+def get_balances(addr, proxy=None):
+    web3 = fetch_web3(proxy)
     results = []
     for label, asset_addr in TOKENS:
         contract = web3.eth.contract(address=web3.to_checksum_address(asset_addr), abi=ERC20_ABI)
@@ -121,46 +136,69 @@ def get_balances(addr):
             results.append((label, "ERR"))
     return results
 
-async def mint_loop():
+async def wallet_worker(priv, proxy):
+    addr = derive_addr(priv)
+    if not addr:
+        banner(f"{Fore.RED}Bad key: {priv}")
+        return {"addr": None, "balances": [], "proxy": proxy}
+    banner(f"{Fore.BLUE}Account: {obfuscate(addr)} with Proxy {proxy if proxy else 'None'}")
+    for label, asset_addr in TOKENS:
+        banner(f"{Fore.CYAN}Minting {label} using {proxy if proxy else 'no proxy'}")
+        try:
+            await faucet_mint(priv, addr, asset_addr, label, proxy)
+        except Exception as e:
+            banner(f"{Fore.RED}Proxy failed for {obfuscate(addr)}: {e}. Trying next proxy.")
+            return None  # Signal proxy failed
+        await asyncio.sleep(random.randint(*SLEEP_RANGE))
+    balances = get_balances(addr, proxy)
+    return {"addr": addr, "balances": balances, "proxy": proxy}
+
+async def mint_loop(run_with_proxy):
     header()
     try:
         with open('accounts.txt', 'r') as f:
             privs = [l.strip() for l in f if l.strip()]
-        banner(f"{Fore.GREEN}Loaded {len(privs)} accounts")
+        proxies = parse_proxies() if run_with_proxy else []
+        banner(f"{Fore.GREEN}Loaded {len(privs)} accounts & {len(proxies)} proxies")
 
         count = 0
         while True:
             count += 1
             banner(f"{Fore.MAGENTA}--- Cycle {count} ---")
-            for priv in privs:
-                addr = derive_addr(priv)
-                if not addr:
-                    banner(f"{Fore.RED}Bad key: {priv}")
-                    continue
-                banner(f"{Fore.BLUE}Account: {obfuscate(addr)}")
-                for label, asset_addr in TOKENS:
-                    banner(f"{Fore.CYAN}Minting {label}")
-                    await faucet_mint(priv, addr, asset_addr, label)
-                    await asyncio.sleep(random.randint(*SLEEP_RANGE))
-            # Show balances after each cycle
+            tasks = []
+            for idx, priv in enumerate(privs):
+                proxy = proxies[idx % len(proxies)] if (proxies and run_with_proxy) else None
+                attempt = 0
+                result = None
+                while attempt < len(proxies) if (proxies and run_with_proxy) else 1:
+                    result = await wallet_worker(priv, proxy)
+                    if result is None and run_with_proxy and proxies:
+                        attempt += 1
+                        proxy = proxies[(idx + attempt) % len(proxies)]
+                        continue
+                    else:
+                        break
+                tasks.append(result)
             banner(f"{Fore.WHITE}=== WALLET STATUS: Faucet Token Balances ===", Fore.WHITE)
-            for priv in privs:
-                addr = derive_addr(priv)
-                if not addr:
+            for info in tasks:
+                if not info or not info["addr"]:
                     continue
-                balances = get_balances(addr)
-                balance_str = " | ".join([f"{lbl}: {bal}" for lbl, bal in balances])
-                banner(f"{Fore.YELLOW}{obfuscate(addr)} -> {balance_str}", Fore.YELLOW)
+                balance_str = " | ".join([f"{lbl}: {bal}" for lbl, bal in info["balances"]])
+                banner(f"{Fore.YELLOW}{obfuscate(info['addr'])} [{info['proxy'] if info['proxy'] else 'no proxy'}] -> {balance_str}", Fore.YELLOW)
             banner(f"{Fore.YELLOW}Cycle complete. Waiting {LOOP_PAUSE}s.")
             await asyncio.sleep(LOOP_PAUSE)
     except FileNotFoundError:
-        banner(f"{Fore.RED}Missing accounts.txt")
+        banner(f"{Fore.RED}Missing accounts.txt or proxy.txt")
     except Exception as e:
         banner(f"{Fore.RED}Fatal error: {e}")
         raise e
 
 if __name__ == "__main__":
+    print(f"\n{Fore.CYAN}==== {BOT_NAME} by {DEV_NAME} ===={Style.RESET_ALL}")
+    print(f"{Fore.WHITE}[1] Run with proxy\n[2] Run without proxy{Style.RESET_ALL}")
+    choice = input(f"{Fore.YELLOW}Choose option (1/2): {Style.RESET_ALL}").strip()
+    run_with_proxy = True if choice == "1" else False
     try:
-        asyncio.run(mint_loop())
+        asyncio.run(mint_loop(run_with_proxy))
     except KeyboardInterrupt:
         banner(f"{Fore.RED}[EXIT] Mint script terminated.")
